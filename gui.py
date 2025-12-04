@@ -1,8 +1,7 @@
 # gui.py
 import os
 from PySide6.QtCore import QThread, Qt, Slot
-from worker import ScraperWorker
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QPixmap, QIcon
 from PySide6.QtWidgets import QProgressBar, QTextEdit, QMessageBox
 
 from PySide6.QtWidgets import (
@@ -13,6 +12,8 @@ from PySide6.QtWidgets import (
 )
 
 import requests
+from worker import ScraperWorker
+
 
 class ModernTrackerGUI(QMainWindow):
     def __init__(self):
@@ -26,6 +27,17 @@ class ModernTrackerGUI(QMainWindow):
         self.worker = None
 
         self.setup_ui()
+        self._try_load_icon()
+
+    def _try_load_icon(self):
+        # If you put app_icon.png into the project folder, the GUI will use it.
+        path = os.path.join(os.getcwd(), "app_icon.png")
+        if os.path.exists(path):
+            try:
+                icon = QIcon(path)
+                self.setWindowIcon(icon)
+            except Exception:
+                pass
 
     def setup_ui(self):
         central = QWidget()
@@ -68,8 +80,8 @@ class ModernTrackerGUI(QMainWindow):
         self.proxy_textbox = QTextEdit()
         self.proxy_textbox.setPlaceholderText(
             "Enter proxies here (one per line):\n"
-            "http://user:pass@ip:port\n"
-            "http://ip:port"
+            "ip:port:user:pass  OR http://user:pass@ip:port\n"
+            "Examples:\n142.111.48.253:7030:username:password\nhttp://username:password@1.2.3.4:8080"
         )
         self.proxy_textbox.setFixedHeight(100)
         general_layout.addWidget(self.labeled_widget("Proxy List (Rotating):", self.proxy_textbox))
@@ -89,7 +101,7 @@ class ModernTrackerGUI(QMainWindow):
         self.out_dir_btn.clicked.connect(self.select_folder)
 
         self.export_format_input = QComboBox()
-        self.export_format_input.addItems(["csv", "xls", "xlsx", "json"])
+        self.export_format_input.addItems(["csv", "xlsx", "json"])
 
         general_layout.addWidget(self.labeled_widget("Product Search:", self.product_input))
         general_layout.addWidget(self.labeled_widget("ASINs (space separated):", self.asin_input))
@@ -125,9 +137,9 @@ class ModernTrackerGUI(QMainWindow):
         price_layout = QVBoxLayout(price_tab)
         price_layout.setAlignment(Qt.AlignTop)
         self.min_price_input = QDoubleSpinBox()
-        self.min_price_input.setMaximum(999999)
+        self.min_price_input.setMaximum(10_000_000)
         self.max_price_input = QDoubleSpinBox()
-        self.max_price_input.setMaximum(999999)
+        self.max_price_input.setMaximum(10_000_000)
         self.max_price_input.setValue(9999)
         price_layout.addWidget(self.labeled_widget("Min Price:", self.min_price_input))
         price_layout.addWidget(self.labeled_widget("Max Price:", self.max_price_input))
@@ -144,10 +156,10 @@ class ModernTrackerGUI(QMainWindow):
         self.max_rating_input.setRange(0, 5)
         self.max_rating_input.setValue(5)
         self.min_reviews_input = QSpinBox()
-        self.min_reviews_input.setMaximum(9999999)
+        self.min_reviews_input.setMaximum(1_000_000_000)
         self.max_reviews_input = QSpinBox()
-        self.max_reviews_input.setMaximum(9999999)
-        self.max_reviews_input.setValue(9999999)
+        self.max_reviews_input.setMaximum(1_000_000_000)
+        self.max_reviews_input.setValue(1_000_000_000)
         rating_layout.addWidget(self.labeled_widget("Min Rating:", self.min_rating_input))
         rating_layout.addWidget(self.labeled_widget("Max Rating:", self.max_rating_input))
         rating_layout.addWidget(self.labeled_widget("Min Reviews:", self.min_reviews_input))
@@ -199,20 +211,28 @@ class ModernTrackerGUI(QMainWindow):
         bsr_layout = QVBoxLayout(bsr_tab)
         bsr_layout.setAlignment(Qt.AlignTop)
         self.bsr_min_input = QSpinBox()
-        self.bsr_min_input.setMaximum(9999999)
+        self.bsr_min_input.setMaximum(9_999_999)
         self.bsr_max_input = QSpinBox()
-        self.bsr_max_input.setMaximum(9999999)
-        self.bsr_max_input.setValue(9999999)
+        self.bsr_max_input.setMaximum(9_999_999)
+        self.bsr_max_input.setValue(9_999_999)
         self.max_pages_input = QSpinBox()
-        self.max_pages_input.setMaximum(100)
+        self.max_pages_input.setMaximum(1000)
         self.max_pages_input.setValue(5)
         self.pages_per_proxy_input = QSpinBox()
-        self.pages_per_proxy_input.setMaximum(100)
+        self.pages_per_proxy_input.setMaximum(1000)
         self.pages_per_proxy_input.setValue(2)
+        self.start_page_input = QSpinBox()
+        self.start_page_input.setMaximum(100000)
+        self.start_page_input.setValue(1)
+        self.max_products_input = QSpinBox()
+        self.max_products_input.setMaximum(1000000)
+        self.max_products_input.setValue(0)
         bsr_layout.addWidget(self.labeled_widget("BSR Min:", self.bsr_min_input))
         bsr_layout.addWidget(self.labeled_widget("BSR Max:", self.bsr_max_input))
         bsr_layout.addWidget(self.labeled_widget("Max Pages:", self.max_pages_input))
         bsr_layout.addWidget(self.labeled_widget("Pages per Proxy:", self.pages_per_proxy_input))
+        bsr_layout.addWidget(self.labeled_widget("Start Page:", self.start_page_input))
+        bsr_layout.addWidget(self.labeled_widget("Max Products (0 = no limit):", self.max_products_input))
         self.tabs.addTab(bsr_tab, "BSR/Pages")
 
         # Advanced
@@ -239,14 +259,15 @@ class ModernTrackerGUI(QMainWindow):
         scroll.setWidget(sidebar_widget)
         main_layout.addWidget(scroll, 1)
 
-        # Result table
-        self.table = QTableWidget()
-        self.table.setColumnCount(20)
-        self.table.setHorizontalHeaderLabels([
+        # Result table - now with description + availability columns
+        headers = [
             "Title", "ASIN", "Price", "Rating", "Reviews", "Prime", "Stock", "URL", "Image URL",
             "Brand", "Condition", "Seller Type", "Discount", "Category Node", "BSR", "Currency",
-            "Country", "Include Keywords", "Exclude Keywords", "Other"
-        ])
+            "Country", "Include Keywords", "Exclude Keywords", "Availability", "Description", "Other"
+        ]
+        self.table = QTableWidget()
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
         self.table.horizontalHeader().setStretchLastSection(True)
         main_layout.addWidget(self.table, 2)
 
@@ -254,13 +275,22 @@ class ModernTrackerGUI(QMainWindow):
 
     def load_proxies(self):
         raw = self.proxy_textbox.toPlainText().strip().split("\n")
-        proxies = [p.strip() for p in raw if p.strip()]
-
+        proxies = []
+        for p in raw:
+            p = p.strip()
+            if not p:
+                continue
+            # Normalize common "ip:port:user:pass" -> http://user:pass@ip:port
+            parts = p.split(':')
+            if len(parts) == 4:
+                ip, port, user, pwd = parts
+                proxies.append(f"http://{user}:{pwd}@{ip}:{port}")
+            else:
+                proxies.append(p)
         if not proxies:
             self.write_log("⚠ No proxies loaded — using direct connection.")
         else:
             self.write_log(f"Loaded {len(proxies)} proxies.")
-
         return proxies
 
     def stop_scraping(self):
@@ -268,6 +298,7 @@ class ModernTrackerGUI(QMainWindow):
             try:
                 self.worker.stop()
                 self.stop_btn.setEnabled(False)
+                self.write_log("Stop requested. Waiting for thread to finish...")
             except Exception:
                 pass
 
@@ -305,6 +336,11 @@ class ModernTrackerGUI(QMainWindow):
             self.apply_styles()
 
     def track_price(self):
+        # Prevent multiple threads running
+        if self.thread is not None and self.thread.isRunning():
+            self.write_log("⚠ Scraper is already running. Please stop it first.")
+            return
+
         proxies = self.load_proxies()
 
         search_term = self.product_input.text().strip()
@@ -325,6 +361,7 @@ class ModernTrackerGUI(QMainWindow):
         country = self.country_input.currentText()
         currency = self.currency_input.currentText()
         image_dir = self.image_dir_input.text().strip() or None
+        out_folder = self.out_dir_input.text().strip() or ""
 
         filters = {
             "min": self.min_price_input.value(),
@@ -352,9 +389,18 @@ class ModernTrackerGUI(QMainWindow):
             "use_uc": self.use_uc.isChecked(),
             "headless": self.headless.isChecked(),
             "base_url": base_url,
+            "output_folder": out_folder,
+            "export_format": self.export_format_input.currentText(),
+            "start_page": self.start_page_input.value(),
+            "max_products": self.max_products_input.value(),
         }
 
         self.table.setRowCount(0)
+        self.progress_bar.setValue(0)
+        self.write_log("[▶] Starting scraping...")
+        # Disable start button while running
+        self.track_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
 
         self.worker = ScraperWorker(
             search_term=search_term,
@@ -368,6 +414,7 @@ class ModernTrackerGUI(QMainWindow):
         self.thread = QThread()
         self.worker.moveToThread(self.thread)
 
+        # Connect signals
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self.update_progress)
         self.worker.log.connect(self.write_log)
@@ -376,12 +423,20 @@ class ModernTrackerGUI(QMainWindow):
         self.worker.finished.connect(self.scraping_done)
         self.worker.error.connect(self.thread_error)
 
+        # Cleanup
         self.worker.finished.connect(self.worker.deleteLater)
         self.worker.finished.connect(self.thread.quit)
         self.thread.finished.connect(self.thread.deleteLater)
+        # Ensure GUI re-enabled when thread finishes for any reason
+        self.thread.finished.connect(lambda: self._on_thread_finished())
 
         self.thread.start()
-        self.stop_btn.setEnabled(True)
+
+    def _on_thread_finished(self):
+        # called when thread finishes
+        self.track_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.progress_bar.setValue(100)
 
     def scraping_done(self, products):
         self.write_log(f"[✔] Scraping finished. Total products: {len(products)}")
@@ -389,12 +444,14 @@ class ModernTrackerGUI(QMainWindow):
             self.populate_table(products)
         finally:
             self.stop_btn.setEnabled(False)
+            self.track_btn.setEnabled(True)
             self.progress_bar.setValue(100)
 
     def thread_error(self, msg):
         QMessageBox.critical(self, "Error", msg)
         print(msg)
         self.stop_btn.setEnabled(False)
+        self.track_btn.setEnabled(True)
 
     def download_images(self, products):
         folder = self.image_dir_input.text().strip() or "images"
@@ -436,33 +493,47 @@ class ModernTrackerGUI(QMainWindow):
         self.log_box.append(msg)
 
     def add_live_row(self, product):
+        # Add a live row mapping fields to table columns by header name
+        headers = [self.table.horizontalHeaderItem(i).text() for i in range(self.table.columnCount())]
         row = self.table.rowCount()
         self.table.insertRow(row)
-
-        col = 0
-        for key in product.keys():
+        for col, header in enumerate(headers):
             try:
-                if key in ("image", "image_url"):
-                    pix = QPixmap(product.get(key) or "")
+                # map header to product keys
+                key = header.lower().replace(" ", "_")
+                # special mappings
+                if header == "ASIN":
+                    key = "asin"
+                if header == "Title":
+                    key = "title"
+                if header == "Image URL":
+                    key = "image_url"
+                if header == "Availability":
+                    key = "availability"
+                if header == "Description":
+                    key = "description"
+                value = product.get(key, "")
+                if header in ("Image URL",):
+                    pix = QPixmap(value or "")
                     if not pix.isNull():
                         item = QTableWidgetItem()
                         item.setData(Qt.DecorationRole, pix.scaled(80, 80))
                         self.table.setItem(row, col, item)
                     else:
-                        self.table.setItem(row, col, QTableWidgetItem(str(product.get(key, ""))))
+                        self.table.setItem(row, col, QTableWidgetItem(str(value)))
                 else:
-                    self.table.setItem(row, col, QTableWidgetItem(str(product.get(key, ""))))
+                    self.table.setItem(row, col, QTableWidgetItem(str(value)))
             except Exception:
                 try:
-                    self.table.setItem(row, col, QTableWidgetItem(str(product.get(key, ""))))
+                    self.table.setItem(row, col, QTableWidgetItem(str(product)))
                 except Exception:
                     pass
-            col += 1
 
     def scraping_stopped(self):
         self.write_log("[⚠] Scraping stopped.")
         self.progress_bar.setValue(0)
         self.stop_btn.setEnabled(False)
+        self.track_btn.setEnabled(True)
 
     def populate_table(self, products):
         self.table.setRowCount(len(products))
@@ -486,7 +557,9 @@ class ModernTrackerGUI(QMainWindow):
             self.table.setItem(row, 16, QTableWidgetItem(p.get("country", "")))
             self.table.setItem(row, 17, QTableWidgetItem(", ".join(p.get("include_keywords", []))))
             self.table.setItem(row, 18, QTableWidgetItem(", ".join(p.get("exclude_keywords", []))))
-            self.table.setItem(row, 19, QTableWidgetItem(str(p.get("other", ""))))
+            self.table.setItem(row, 19, QTableWidgetItem(p.get("availability", "")))
+            self.table.setItem(row, 20, QTableWidgetItem(p.get("description", "")))
+            self.table.setItem(row, 21, QTableWidgetItem(str(p.get("other", ""))))
 
     def select_image_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Image Folder")

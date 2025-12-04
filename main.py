@@ -3,7 +3,6 @@ import sys
 from PySide6.QtWidgets import QApplication
 from gui import ModernTrackerGUI
 
-
 def main():
     app = QApplication(sys.argv)
     w = ModernTrackerGUI()

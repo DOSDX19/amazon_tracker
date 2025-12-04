@@ -8,37 +8,32 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 import undetected_chromedriver as uc
 
-# -------------------------
-# CONFIG (edit these with real proxies / user agents)
-# -------------------------
-PROXIES = [
-    # Example proxies - replace or leave empty
-    # "http://username:password@proxy1:port",
-]
+# CONFIG - tweak these lists if you want
+PROXIES = []
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0"
 ]
+
 
 def random_proxy() -> Optional[str]:
     if not PROXIES:
         return None
     return random.choice(PROXIES)
 
+
 def random_user_agent() -> str:
     return random.choice(USER_AGENTS)
 
 
 class AmazonAPI:
-    """
-    AmazonAPI - scraping engine.
-    Supports:
-     - run() : search-based scraping using internal search_term & filters
-     - track_asins(asin_list) : visit /dp/ASIN pages
-     - scrape_products(url, page, filters) : returns listing items for a search page
-     - build_search_url(page=1) : robust URL builder
+    """Lightweight Amazon scraping engine compatible with the GUI/worker.
+
+    - Uses undetected_chromedriver by default (falls back to regular chromedriver)
+    - Respects an external `requester` object that can provide rotating proxies
+    - Provides: build_search_url(), scrape_products(), track_asins(), get_single_product_info()
+    - All text fields are stripped/cleaned before returning
     """
 
     def __init__(
@@ -60,18 +55,14 @@ class AmazonAPI:
         self.use_uc = use_uc
         self.headless = headless
         self.pages_per_proxy = pages_per_proxy or int(self.filters.get("pages_per_proxy", 2))
-
-        # Optional proxy requester (your RotatingProxyRequester instance)
         self.requester = requester
-
-        # country (optional)
         self.country = country
 
         self.driver = None
         self.wait = None
         self._stop_requested = False
 
-    # ---------------- Driver management ----------------
+    # ---------------- low-level driver helpers ----------------
     def _get_next_proxy(self, explicit_proxy: Optional[str] = None) -> Optional[str]:
         if explicit_proxy:
             return explicit_proxy
@@ -85,7 +76,7 @@ class AmazonAPI:
         return random_proxy()
 
     def create_driver(self, proxy: Optional[str] = None):
-        # close previous driver
+        # close existing
         try:
             if self.driver:
                 try:
@@ -109,25 +100,22 @@ class AmazonAPI:
         options.add_argument("--ignore-certificate-errors")
 
         if self.headless:
-            # "new" headless flag works with newer chrome versions; fallback if necessary
             options.add_argument("--headless=new")
 
-        # pick UA
         try:
             ua = random_user_agent()
             options.add_argument(f"user-agent={ua}")
         except Exception:
             pass
 
-        # resolve proxy
         chosen_proxy = self._get_next_proxy(proxy)
         if chosen_proxy:
             try:
+                # Accept formats like ip:port or http://user:pass@ip:port
                 options.add_argument(f"--proxy-server={chosen_proxy}")
             except Exception:
                 pass
 
-        # create driver
         try:
             if self.use_uc:
                 try:
@@ -139,136 +127,57 @@ class AmazonAPI:
         except Exception as e:
             raise RuntimeError(f"Failed to create driver: {e}")
 
-        self.wait = WebDriverWait(self.driver, 12)
+        # short wait helper
+        try:
+            self.wait = WebDriverWait(self.driver, 12)
+        except Exception:
+            self.wait = None
+
+        # warmup
         time.sleep(random.uniform(0.8, 1.6))
         return self.driver
 
     def cleanup(self):
-        """Safe cleanup helper (use this from outside)."""
         try:
             if self.driver:
-                self.driver.quit()
+                # try to stop service process if available (best-effort)
+                try:
+                    svc = getattr(self.driver, "service", None)
+                    proc = getattr(svc, "process", None)
+                    if proc:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                try:
+                    self.driver.quit()
+                except Exception:
+                    pass
         except Exception:
             pass
+        finally:
+            self.driver = None
 
     def stop(self):
         self._stop_requested = True
+        # attempt immediate cleanup
+        try:
+            self.cleanup()
+        except Exception:
+            pass
 
     def should_stop(self) -> bool:
         return self._stop_requested
 
-    # ---------------- Main entry points ----------------
-    def run(self) -> List[Dict[str, Any]]:
-        """High-level run() that uses internal search_term & filters to return detailed products."""
-        self._stop_requested = False
-        max_pages = int(self.filters.get("max_pages", 1))
-        collected = []
-
-        current_proxy = None
-        for page in range(1, max_pages + 1):
-            if self.should_stop():
-                break
-
-            if (page - 1) % self.pages_per_proxy == 0:
-                current_proxy = self._get_next_proxy(None)
-                try:
-                    self.create_driver(proxy=current_proxy)
-                except Exception:
-                    try:
-                        self.create_driver(proxy=None)
-                    except Exception:
-                        continue
-
-            search_url = self.build_search_url(page=page)
-            try:
-                self.driver.get(search_url)
-            except Exception:
-                try:
-                    self.create_driver(proxy=None)
-                    self.driver.get(search_url)
-                except Exception:
-                    continue
-
-            time.sleep(random.uniform(1.4, 3.0))
-            page_products = self._extract_search_page_products()
-            collected.extend(page_products)
-            time.sleep(random.uniform(0.4, 1.0))
-
-        # close search driver
-        try:
-            if self.driver:
-                self.driver.quit()
-        except Exception:
-            pass
-
-        # visit product pages for details
-        final = []
-        for prod in collected:
-            if self.should_stop():
-                break
-            try:
-                self.create_driver(proxy=self._get_next_proxy(None))
-            except Exception:
-                try:
-                    self.create_driver(proxy=None)
-                except Exception:
-                    continue
-
-            try:
-                item = self._get_full_product_from_listing(prod)
-                if item and self._passes_advanced_filters(item):
-                    final.append(item)
-            except Exception:
-                pass
-
-            try:
-                if self.driver:
-                    self.driver.quit()
-            except Exception:
-                pass
-
-            time.sleep(random.uniform(0.8, 1.6))
-
-        return final
-
-    def track_asins(self, asin_list: List[str]) -> List[Dict[str, Any]]:
-        products = []
-        try:
-            self.create_driver(proxy=self._get_next_proxy(None))
-        except Exception:
-            self.create_driver(proxy=None)
-
-        for asin in asin_list:
-            if self.should_stop():
-                break
-            url = f"{self.base_url}/dp/{asin}"
-            try:
-                prod = self.get_single_product_info(url)
-                if prod and self._passes_advanced_filters(prod):
-                    products.append(prod)
-            except Exception:
-                pass
-            time.sleep(random.uniform(1.0, 2.0))
-
-        try:
-            if self.driver:
-                self.driver.quit()
-        except Exception:
-            pass
-
-        return products
-
-    # ---------------- URL building ----------------
+    # ---------------- URL builder / page scraping ----------------
     def build_search_url(self, page: int = 1) -> str:
-        """
-        Build search URL. Safe handling of page param and filters.
-        """
         base = self.base_url.rstrip("/")
         q = (self.search_term or "").strip()
         q_enc = q.replace(" ", "+")
         url = f"{base}/s?k={q_enc}"
 
-        # price
         min_p = self.filters.get("min", None)
         max_p = self.filters.get("max", None)
         price_fragment = self._price_fragment_for_domain(self.base_url, min_p, max_p)
@@ -287,7 +196,6 @@ class AmazonAPI:
         if page_num > 1:
             url = url + f"&page={page_num}"
 
-        # category node
         if self.filters.get("category_node"):
             url += f"&i={self.filters.get('category_node')}"
 
@@ -303,7 +211,7 @@ class AmazonAPI:
             return ""
 
         domain_name = domain.split("//")[-1].split("/")[0].lower()
-        if domain_name.endswith(".com") or domain_name.endswith(".ca") or domain_name.endswith(".com.au") or domain_name.endswith(".co.uk"):
+        if domain_name.endswith((".com", ".ca", ".com.au", ".co.uk")):
             parts = []
             if min_val is not None:
                 parts.append(f"low-price={int(min_val)}")
@@ -312,10 +220,12 @@ class AmazonAPI:
             if parts:
                 return "&" + "&".join(parts)
             return ""
+
         if domain_name.endswith((".de", ".fr", ".it", ".es", ".nl", ".se", ".pl")):
             min_cents = int(min_val * 100) if min_val is not None else 0
             max_cents = int(max_val * 100) if max_val is not None else 0
             return f"&rh=p_36:{min_cents}-{max_cents}"
+
         parts = []
         if min_val is not None:
             parts.append(f"low-price={int(min_val)}")
@@ -325,7 +235,47 @@ class AmazonAPI:
             return "&" + "&".join(parts)
         return ""
 
-    # ---------------- Extract from search page ----------------
+    def scrape_products(self, url: Optional[str] = None, page: int = 1, filters: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        """Scrape a search results page and return partial product dicts (listing info).
+        This is useful for iterating pages without immediately visiting product pages.
+        """
+        if filters:
+            # merge incoming filters (caller passes references)
+            try:
+                self.filters.update(filters)
+            except Exception:
+                self.filters = filters
+
+        if url:
+            search_url = url
+        else:
+            search_url = self.build_search_url(page=page)
+
+        # Ensure a driver
+        if not self.driver:
+            try:
+                self.create_driver(proxy=self._get_next_proxy(None))
+            except Exception:
+                self.create_driver(proxy=None)
+
+        try:
+            self.driver.get(search_url)
+        except Exception:
+            return []
+
+        time.sleep(random.uniform(1.0, 2.0))
+        results = self._extract_search_page_products()
+
+        # clean up driver to avoid many open browsers; caller may reopen as needed
+        try:
+            if self.driver:
+                self.driver.quit()
+        except Exception:
+            pass
+        self.driver = None
+
+        return results
+
     def _extract_search_page_products(self) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
         try:
@@ -353,6 +303,7 @@ class AmazonAPI:
                             url = f"{self.base_url.rstrip('/')}{href}"
                 except Exception:
                     url = ""
+
                 price = None
                 try:
                     whole = c.find_element(By.CLASS_NAME, "a-price-whole").text
@@ -369,6 +320,7 @@ class AmazonAPI:
                         price = self._normalize_price_text(el.get_attribute("innerText") or el.text)
                     except Exception:
                         price = None
+
                 img = ""
                 try:
                     img_el = c.find_element(By.XPATH, ".//img")
@@ -376,14 +328,13 @@ class AmazonAPI:
                 except Exception:
                     img = ""
 
-                # include both image_url and 'image' for compatibility
                 results.append({
                     "asin": asin,
                     "title": title,
                     "url": url,
                     "price": price,
                     "image_url": img,
-                    "image": img,   # alias used by GUI/worker
+                    "image": img,
                 })
             except Exception:
                 continue
@@ -405,7 +356,11 @@ class AmazonAPI:
         except Exception:
             return None
 
-    # ---------------- Visit product page to get full info ----------------
+    # ---------------- product page scraping ----------------
+    def get_single_product_info(self, url: str) -> Optional[Dict[str, Any]]:
+        # kept for backward compatibility with some callers (worker used get_single_product_info)
+        return self._get_full_product_from_listing({"url": url})
+
     def _get_full_product_from_listing(self, listing: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         url = listing.get("url")
         if not url:
@@ -414,23 +369,26 @@ class AmazonAPI:
                 url = f"{self.base_url}/dp/{asin}"
             else:
                 return None
-        return self.get_single_product_info(url)
+        return self._visit_and_extract(url)
 
-    def get_single_product_info(self, url: str) -> Optional[Dict[str, Any]]:
+    def _visit_and_extract(self, url: str) -> Optional[Dict[str, Any]]:
         if self.should_stop():
             return None
+
         if not self.driver:
             try:
                 self.create_driver(proxy=self._get_next_proxy(None))
             except Exception:
                 self.create_driver(proxy=None)
+
         try:
             self.driver.get(url)
         except Exception:
             return None
+
         time.sleep(random.uniform(1.0, 2.2))
 
-        title = self._safe_text_by_id("productTitle")
+        title = self._safe_text_by_id("productTitle") or ""
         price = self.get_price()
         rating = self._extract_rating()
         review_count = self._extract_review_count()
@@ -439,23 +397,34 @@ class AmazonAPI:
         seller_info = self._extract_seller_info()
         bsr = self._extract_bsr()
 
-        brand = None
+        # description
+        description = ""
         try:
-            brand = self._safe_text_by_id("bylineInfo")
-            if brand:
-                brand = brand.strip()
+            desc_el = self.driver.find_element(By.ID, "productDescription")
+            description = desc_el.text.strip()
         except Exception:
-            brand = None
+            try:
+                meta = self.driver.find_element(By.XPATH, "//meta[@name='description']")
+                description = meta.get_attribute("content") or ""
+            except Exception:
+                description = ""
 
-        condition = None
+        brand = ""
+        try:
+            brand = self._safe_text_by_id("bylineInfo") or ""
+            brand = brand.strip()
+        except Exception:
+            brand = ""
+
+        condition = ""
         try:
             cond = self.driver.find_elements(By.ID, "condition")
             if cond:
                 condition = cond[0].text.strip()
         except Exception:
-            condition = None
+            condition = ""
 
-        seller_type = None
+        seller_type = ""
         if seller_info:
             s = seller_info.lower()
             if "fulfilled by amazon" in s or "fba" in s:
@@ -481,10 +450,11 @@ class AmazonAPI:
 
         main_image = images[0] if images else ""
 
-        return {
+        product = {
             "asin": self.extract_asin(url),
             "url": url,
             "title": title or "",
+            "description": description or "",
             "seller": seller_info or "",
             "price": price,
             "rating": rating,
@@ -504,8 +474,15 @@ class AmazonAPI:
             "country": country,
             "include_keywords": self.filters.get("include_keywords") or [],
             "exclude_keywords": self.filters.get("exclude_keywords") or [],
-            "other": None
+            "other": None,
         }
+
+        # clean all string fields
+        for k, v in list(product.items()):
+            if isinstance(v, str):
+                product[k] = v.strip()
+
+        return product
 
     def _safe_text_by_id(self, elem_id: str) -> Optional[str]:
         try:
@@ -530,7 +507,7 @@ class AmazonAPI:
             '//*[@id="corePriceDisplay_desktop_feature_div"]//span[contains(@class,"a-price-whole")]',
             '//*[@id="priceblock_dealprice"]',
             '//*[@id="priceblock_ourprice"]',
-            "//span[contains(@class,'a-offscreen') and (contains(text(),'$') or contains(text(),'€') or contains(text(),'£'))]"
+            "//span[contains(@class,'a-offscreen') and (contains(text(),'$') or contains(text(),'€') or contains(text(),'£'))]",
         ]
         for xp in xpaths:
             try:
@@ -544,12 +521,14 @@ class AmazonAPI:
                         return val
             except Exception:
                 pass
+
         try:
             el = self.driver.find_element(By.CSS_SELECTOR, "span.a-price span.a-offscreen")
             txt = el.get_attribute("innerText") or el.text or ""
             return self.parse_price(txt)
         except Exception:
             pass
+
         return None
 
     def parse_price(self, p: str) -> Optional[float]:
@@ -621,7 +600,7 @@ class AmazonAPI:
     def _extract_images(self, limit: int = 8) -> List[str]:
         imgs: List[str] = []
         try:
-            candidates = self.driver.find_elements(By.CSS_SELECTOR, "img")
+            candidates = self.driver.find_elements(By.XPATH, ".//img[contains(@class,'s-image')]")
             for t in candidates:
                 src = t.get_attribute("src")
                 if src and src.startswith("http") and "sprite" not in src and "data:image" not in src:
@@ -675,7 +654,7 @@ class AmazonAPI:
 
         reviews = int(product.get("reviews") or product.get("review_count") or 0)
         min_reviews = int(self.filters.get("min_reviews", 0))
-        max_reviews = int(self.filters.get("max_reviews", 99999999))
+        max_reviews = int(self.filters.get("max_reviews", 1000000000))
         if reviews < min_reviews or reviews > max_reviews:
             return False
 
@@ -709,7 +688,7 @@ class AmazonAPI:
 
         bsr = product.get("bsr") or 0
         bsr_min = int(self.filters.get("bsr_min", 0))
-        bsr_max = int(self.filters.get("bsr_max", 99999999))
+        bsr_max = int(self.filters.get("bsr_max", 1000000000))
         if bsr:
             if bsr < bsr_min or bsr > bsr_max:
                 return False
